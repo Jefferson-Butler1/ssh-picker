@@ -29,6 +29,10 @@ pub enum UiAction {
     NewHost,
     DeleteSelected,
     LaunchSelected,
+    FormNextField,
+    FormPrevField,
+    FormSubmit,
+    FormCancel,
     Quit,
     Noop,
 }
@@ -92,6 +96,40 @@ pub fn draw_ui(f: &mut Frame<'_>, state: &AppState) {
         f.render_widget(Clear, area); // clear background
         f.render_widget(para, area);
     }
+
+    if let Mode::EditForm(form) = &state.mode {
+        let area = centered_rect(80, 60, f.area());
+        let title = if form.is_editing { "Edit Host" } else { "New Host" };
+        let block = Block::default().borders(Borders::ALL).title(title);
+
+        let fields = [
+            ("Host Pattern", &form.pattern),
+            ("HostName", &form.hostname),
+            ("User", &form.user),
+            ("Port", &form.port),
+        ];
+
+        let mut text = vec![
+            Line::from(Span::raw("Use Tab/Shift+Tab to navigate, Enter to save, Esc to cancel")),
+            Span::raw("").into(),
+        ];
+
+        for (i, (label, value)) in fields.iter().enumerate() {
+            let style = if i == form.current_field {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            text.push(Line::from(vec![
+                Span::styled(format!("{:12}: ", label), Style::default().fg(Color::Cyan)),
+                Span::styled(value.as_str(), style),
+            ]));
+        }
+
+        let para = Paragraph::new(text).block(block).wrap(Wrap { trim: true });
+        f.render_widget(Clear, area);
+        f.render_widget(para, area);
+    }
 }
 
 fn host_to_item(entry: &SshHostEntry) -> ListItem<'_> {
@@ -119,45 +157,46 @@ fn build_list_state(state: &AppState) -> ratatui::widgets::ListState {
     ls
 }
 
-pub fn read_event() -> Result<Event> {
+pub fn read_event(mode: &Mode) -> Result<Event> {
     if event::poll(Duration::from_millis(200))? {
         if let CEvent::Key(key) = event::read()? {
-            return Ok(Event::Action(map_key(key)));
+            return Ok(Event::Action(map_key(key, mode)));
         }
     }
     Ok(Event::Tick)
 }
 
-fn map_key(key: KeyEvent) -> UiAction {
-    match (key.code, key.modifiers) {
-        (KeyCode::Char('q'), _) => UiAction::Quit,
-        (KeyCode::Enter, _) => UiAction::LaunchSelected,
-        (KeyCode::Char('j'), _) | (KeyCode::Down, _) => UiAction::MoveDown,
-        (KeyCode::Char('k'), _) | (KeyCode::Up, _) => UiAction::MoveUp,
-        (KeyCode::PageDown, _) | (KeyCode::Char('f'), KeyModifiers::CONTROL) => UiAction::PageDown,
-        (KeyCode::PageUp, _) | (KeyCode::Char('b'), KeyModifiers::CONTROL) => UiAction::PageUp,
-        (KeyCode::Char('/'), _) => UiAction::BeginFilter,
-        (KeyCode::Esc, _) => UiAction::ClearFilter,
-        (KeyCode::Backspace, _) => UiAction::BackspaceFilter,
-        (KeyCode::Char('e'), _) => UiAction::EditSelected,
-        (KeyCode::Char('a'), _) => UiAction::NewHost,
-        (KeyCode::Char('d'), _) => UiAction::DeleteSelected,
-        (KeyCode::Char(c), _) => UiAction::InputChar(c),
-        _ => UiAction::Noop,
+fn map_key(key: KeyEvent, mode: &Mode) -> UiAction {
+    match mode {
+        Mode::EditForm(_) => match (key.code, key.modifiers) {
+            (KeyCode::Tab, _) => UiAction::FormNextField,
+            (KeyCode::BackTab, _) => UiAction::FormPrevField,
+            (KeyCode::Enter, _) => UiAction::FormSubmit,
+            (KeyCode::Esc, _) => UiAction::FormCancel,
+            (KeyCode::Backspace, _) => UiAction::BackspaceFilter,
+            (KeyCode::Char(c), _) => UiAction::InputChar(c),
+            _ => UiAction::Noop,
+        },
+        _ => match (key.code, key.modifiers) {
+            (KeyCode::Char('q'), _) => UiAction::Quit,
+            (KeyCode::Enter, _) => UiAction::LaunchSelected,
+            (KeyCode::Char('j'), _) | (KeyCode::Down, _) => UiAction::MoveDown,
+            (KeyCode::Char('k'), _) | (KeyCode::Up, _) => UiAction::MoveUp,
+            (KeyCode::PageDown, _) | (KeyCode::Char('f'), KeyModifiers::CONTROL) => UiAction::PageDown,
+            (KeyCode::PageUp, _) | (KeyCode::Char('b'), KeyModifiers::CONTROL) => UiAction::PageUp,
+            (KeyCode::Char('/'), _) => UiAction::BeginFilter,
+            (KeyCode::Esc, _) => UiAction::ClearFilter,
+            (KeyCode::Backspace, _) => UiAction::BackspaceFilter,
+            (KeyCode::Char('e'), _) => UiAction::EditSelected,
+            (KeyCode::Char('a'), _) => UiAction::NewHost,
+            (KeyCode::Char('d'), _) => UiAction::DeleteSelected,
+            (KeyCode::Char(c), _) => UiAction::InputChar(c),
+            _ => UiAction::Noop,
+        },
     }
 }
 
-// Simple pop-up dialogs in the alternate screen are implemented here as blocking in-line forms.
-// For a first pass, we collect fields in stdin/outside of raw mode.
-pub fn edit_host_dialog(existing: &SshHostEntry) -> Result<SshHostEntry> {
-    form_dialog(Some(existing))
-}
-
-pub fn new_host_dialog() -> Result<SshHostEntry> {
-    form_dialog(None)
-}
-
-// legacy non-TUI confirm removed; confirm handled via modal overlay and key events
+// TUI forms now handled via modal overlays and integrated event handling
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     let ver = Layout::default()
@@ -179,39 +218,5 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     hor[1]
 }
 
-fn form_dialog(existing: Option<&SshHostEntry>) -> Result<SshHostEntry> {
-    let mut pattern = existing.map(|e| e.pattern.clone()).unwrap_or_default();
-    let mut hostname = existing.and_then(|e| e.hostname.clone()).unwrap_or_default();
-    let mut user = existing.and_then(|e| e.user.clone()).unwrap_or_default();
-    let mut port = existing.and_then(|e| e.port.map(|p| p.to_string())).unwrap_or_default();
-
-    // Drop raw mode for input
-    crossterm::terminal::disable_raw_mode()?;
-    eprintln!("\nEnter host fields. Leave blank to keep current value.");
-    read_field("Host (pattern)", &mut pattern)?;
-    read_field("HostName", &mut hostname)?;
-    read_field("User", &mut user)?;
-    read_field("Port", &mut port)?;
-    crossterm::terminal::enable_raw_mode()?;
-
-    let port_num = if port.trim().is_empty() { None } else { port.trim().parse().ok() };
-    Ok(SshHostEntry { pattern, hostname: nonempty(hostname), user: nonempty(user), port: port_num, other: vec![] })
-}
-
-fn read_field(label: &str, buf: &mut String) -> Result<()> {
-    eprint!("{} [{}]: ", label, buf.trim());
-    std::io::Write::flush(&mut std::io::stderr())?;
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
-    let v = line.trim().to_string();
-    if !v.is_empty() {
-        *buf = v;
-    }
-    Ok(())
-}
-
-fn nonempty(s: String) -> Option<String> {
-    if s.trim().is_empty() { None } else { Some(s) }
-}
 
 

@@ -1,12 +1,10 @@
-use anyhow::{Context, Result};
-use glob::glob;
+use anyhow::Result;
 use home::home_dir;
-use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct SshHostEntry {
     pub pattern: String,
     pub hostname: Option<String>,
@@ -17,10 +15,46 @@ pub struct SshHostEntry {
 
 impl SshHostEntry {
     pub fn matches(&self, q: &str) -> bool {
-        let mut hay = self.pattern.to_lowercase();
-        if let Some(hn) = &self.hostname { hay.push_str(" "); hay.push_str(&hn.to_lowercase()); }
-        if let Some(u) = &self.user { hay.push_str(" "); hay.push_str(&u.to_lowercase()); }
-        hay.contains(q)
+        // Check each field independently to avoid string concatenation
+        self.pattern.to_lowercase().contains(q) ||
+        self.hostname.as_ref().map_or(false, |h| h.to_lowercase().contains(q)) ||
+        self.user.as_ref().map_or(false, |u| u.to_lowercase().contains(q))
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        // Validate pattern - no dangerous characters
+        if self.pattern.is_empty() {
+            return Err(anyhow::anyhow!("Host pattern cannot be empty"));
+        }
+        if self.pattern.contains('\n') || self.pattern.contains('\r') {
+            return Err(anyhow::anyhow!("Host pattern cannot contain newlines"));
+        }
+        if self.pattern.contains(';') || self.pattern.contains('#') {
+            return Err(anyhow::anyhow!("Host pattern cannot contain semicolons or hash symbols"));
+        }
+
+        // Validate hostname if present
+        if let Some(hostname) = &self.hostname {
+            if hostname.contains('\n') || hostname.contains('\r') {
+                return Err(anyhow::anyhow!("HostName cannot contain newlines"));
+            }
+            if hostname.contains(';') || hostname.contains('#') {
+                return Err(anyhow::anyhow!("HostName cannot contain semicolons or hash symbols"));
+            }
+        }
+
+        // Validate user if present  
+        if let Some(user) = &self.user {
+            if user.contains('\n') || user.contains('\r') {
+                return Err(anyhow::anyhow!("User cannot contain newlines"));
+            }
+            if user.contains(';') || user.contains('#') {
+                return Err(anyhow::anyhow!("User cannot contain semicolons or hash symbols"));
+            }
+        }
+
+        // Port validation is handled by parsing
+        Ok(())
     }
 }
 
@@ -55,7 +89,7 @@ impl SshConfigFile {
             std::fs::File::open(&self.path)?.read_to_string(&mut text)?;
         }
 
-        let mut lines: Vec<&str> = text.lines().collect();
+        let lines: Vec<&str> = text.lines().collect();
         // Find existing block starting with "Host <pattern>" (exact match)
         let mut start = None;
         for (i, line) in lines.iter().enumerate() {
@@ -92,10 +126,8 @@ impl SshConfigFile {
             new_text.push_str(&new_block);
         }
 
-        // Ensure .ssh dir exists and write
-        if let Some(parent) = self.path.parent() { fs::create_dir_all(parent)?; }
-        let mut file = OpenOptions::new().create(true).write(true).truncate(true).open(&self.path)?;
-        file.write_all(new_text.as_bytes())?;
+        // Atomic write to prevent corruption
+        write_file_atomic(&self.path, &new_text)?;
 
         // Refresh in-memory
         *self = Self::load(self.path.clone())?;
@@ -126,8 +158,7 @@ impl SshConfigFile {
             i += 1;
         }
 
-        let mut file = OpenOptions::new().create(true).write(true).truncate(true).open(&self.path)?;
-        file.write_all(new_text.as_bytes())?;
+        write_file_atomic(&self.path, &new_text)?;
         *self = Self::load(self.path.clone())?;
         Ok(())
     }
@@ -178,6 +209,29 @@ fn parse_hosts_from_text(text: &str) -> Vec<SshHostEntry> {
     }
     if let Some(entry) = current.take() { hosts.push(entry); }
     hosts
+}
+
+fn write_file_atomic(path: &PathBuf, content: &str) -> Result<()> {
+    // Create parent directory if it doesn't exist
+    if let Some(parent) = path.parent() { 
+        fs::create_dir_all(parent)?; 
+    }
+    
+    // Write to temporary file first
+    let temp_path = path.with_extension("tmp");
+    {
+        let mut temp_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&temp_path)?;
+        temp_file.write_all(content.as_bytes())?;
+        temp_file.sync_all()?; // Ensure data is written to disk
+    }
+    
+    // Atomically rename temp file to target
+    fs::rename(&temp_path, path)?;
+    Ok(())
 }
 
 

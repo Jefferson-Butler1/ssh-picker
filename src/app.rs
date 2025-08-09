@@ -1,5 +1,5 @@
 use crate::ssh_config::{SshConfigFile, SshHostEntry};
-use crate::ui::{draw_ui, Event, UiAction};
+use crate::ui::UiAction;
 use anyhow::{Context, Result};
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
@@ -26,10 +26,10 @@ pub fn run() -> Result<()> {
             terminal.clear()?;
             state.needs_full_redraw = false;
         }
-        terminal.draw(|f| draw_ui(f, &state))?;
+        terminal.draw(|f| crate::ui::draw_ui(f, &state))?;
 
-        match ui::read_event()? {
-            Event::Action(action) => match handle_action(action, &mut state, &mut ssh_cfg)? {
+        match ui::read_event(&state.mode)? {
+            crate::ui::Event::Action(action) => match handle_action(action, &mut state, &mut ssh_cfg)? {
                 LoopControl::Continue => {}
                 LoopControl::Exit => break,
                 LoopControl::Launch(host) => {
@@ -40,7 +40,7 @@ pub fn run() -> Result<()> {
                     reinit_terminal(&mut terminal)?;
                 }
             },
-            Event::Tick => {}
+            crate::ui::Event::Tick => {}
         }
     }
 
@@ -57,9 +57,8 @@ fn teardown_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> R
 
 fn reinit_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    *terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+    execute!(terminal.backend_mut(), EnterAlternateScreen, EnableMouseCapture)?;
+    terminal.clear()?;
     Ok(())
 }
 
@@ -78,13 +77,22 @@ pub enum Mode {
     Normal,
     Filter,
     Confirm(ConfirmContext),
-    Editing,
-    Help,
+    EditForm(FormData),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConfirmContext {
     Delete { pattern: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FormData {
+    pub is_editing: bool,  // true for edit, false for new
+    pub pattern: String,
+    pub hostname: String,
+    pub user: String,
+    pub port: String,
+    pub current_field: usize,  // 0=pattern, 1=hostname, 2=user, 3=port
 }
 
 impl AppState {
@@ -152,7 +160,7 @@ fn handle_action(action: UiAction, state: &mut AppState, ssh_cfg: &mut SshConfig
             state.mode = Mode::Filter;
         }
         InputChar(ch) => {
-            match &state.mode {
+            match &mut state.mode {
                 Mode::Filter => {
                     state.filter_text.push(ch);
                     state.apply_filter();
@@ -160,13 +168,12 @@ fn handle_action(action: UiAction, state: &mut AppState, ssh_cfg: &mut SshConfig
                 Mode::Confirm(ctx) => {
                     match ch {
                         'y' | 'Y' => {
-                            if let ConfirmContext::Delete { pattern } = ctx.clone() {
-                                ssh_cfg.delete_host(&pattern)?;
-                                state.hosts = ssh_cfg.list_hosts();
-                                state.apply_filter();
-                                state.mode = Mode::Normal;
-                                state.needs_full_redraw = true;
-                            }
+                            let ConfirmContext::Delete { pattern } = ctx.clone();
+                            ssh_cfg.delete_host(&pattern)?;
+                            state.hosts = ssh_cfg.list_hosts();
+                            state.apply_filter();
+                            state.mode = Mode::Normal;
+                            state.needs_full_redraw = true;
                         }
                         'n' | 'N' => {
                             state.mode = Mode::Normal;
@@ -175,13 +182,36 @@ fn handle_action(action: UiAction, state: &mut AppState, ssh_cfg: &mut SshConfig
                         _ => {}
                     }
                 }
+                Mode::EditForm(form) => {
+                    let field = match form.current_field {
+                        0 => &mut form.pattern,
+                        1 => &mut form.hostname,
+                        2 => &mut form.user,
+                        3 => &mut form.port,
+                        _ => return Ok(LoopControl::Continue),
+                    };
+                    field.push(ch);
+                }
                 _ => {}
             }
         }
         BackspaceFilter => {
-            if matches!(state.mode, Mode::Filter) {
-                state.filter_text.pop();
-                state.apply_filter();
+            match &mut state.mode {
+                Mode::Filter => {
+                    state.filter_text.pop();
+                    state.apply_filter();
+                }
+                Mode::EditForm(form) => {
+                    let field = match form.current_field {
+                        0 => &mut form.pattern,
+                        1 => &mut form.hostname,
+                        2 => &mut form.user,
+                        3 => &mut form.port,
+                        _ => return Ok(LoopControl::Continue),
+                    };
+                    field.pop();
+                }
+                _ => {}
             }
         }
         ClearFilter => {
@@ -200,18 +230,26 @@ fn handle_action(action: UiAction, state: &mut AppState, ssh_cfg: &mut SshConfig
         }
         EditSelected => {
             if let Some(entry) = state.selected_host().cloned() {
-                let updated = ui::edit_host_dialog(&entry)?;
-                ssh_cfg.upsert_host(&updated)?;
-                state.hosts = ssh_cfg.list_hosts();
-                state.apply_filter();
+                state.mode = Mode::EditForm(FormData {
+                    is_editing: true,
+                    pattern: entry.pattern,
+                    hostname: entry.hostname.unwrap_or_default(),
+                    user: entry.user.unwrap_or_default(),
+                    port: entry.port.map(|p| p.to_string()).unwrap_or_default(),
+                    current_field: 0,
+                });
                 state.needs_full_redraw = true;
             }
         }
         NewHost => {
-            let new_entry = ui::new_host_dialog()?;
-            ssh_cfg.upsert_host(&new_entry)?;
-            state.hosts = ssh_cfg.list_hosts();
-            state.apply_filter();
+            state.mode = Mode::EditForm(FormData {
+                is_editing: false,
+                pattern: String::new(),
+                hostname: String::new(),
+                user: String::new(),
+                port: String::new(),
+                current_field: 0,
+            });
             state.needs_full_redraw = true;
         }
         DeleteSelected => {
@@ -225,6 +263,51 @@ fn handle_action(action: UiAction, state: &mut AppState, ssh_cfg: &mut SshConfig
                 // ignore Enter while confirming
             } else if let Some(entry) = state.selected_host() {
                 return Ok(LoopControl::Launch(entry.pattern.clone()));
+            }
+        }
+        FormNextField => {
+            if let Mode::EditForm(form) = &mut state.mode {
+                form.current_field = (form.current_field + 1) % 4;
+            }
+        }
+        FormPrevField => {
+            if let Mode::EditForm(form) = &mut state.mode {
+                form.current_field = if form.current_field == 0 { 3 } else { form.current_field - 1 };
+            }
+        }
+        FormSubmit => {
+            if let Mode::EditForm(form) = &state.mode {
+                let port_num = if form.port.trim().is_empty() { 
+                    None 
+                } else { 
+                    match form.port.trim().parse::<u16>() {
+                        Ok(p) if p > 0 => Some(p),
+                        _ => return Err(anyhow::anyhow!("Invalid port number")),
+                    }
+                };
+                
+                let entry = SshHostEntry {
+                    pattern: form.pattern.trim().to_string(),
+                    hostname: if form.hostname.trim().is_empty() { None } else { Some(form.hostname.trim().to_string()) },
+                    user: if form.user.trim().is_empty() { None } else { Some(form.user.trim().to_string()) },
+                    port: port_num,
+                    other: vec![],
+                };
+                
+                // Validate entry before saving
+                entry.validate()?;
+                
+                ssh_cfg.upsert_host(&entry)?;
+                state.hosts = ssh_cfg.list_hosts();
+                state.apply_filter();
+                state.mode = Mode::Normal;
+                state.needs_full_redraw = true;
+            }
+        }
+        FormCancel => {
+            if matches!(state.mode, Mode::EditForm(_)) {
+                state.mode = Mode::Normal;
+                state.needs_full_redraw = true;
             }
         }
         Quit => return Ok(LoopControl::Exit),
@@ -243,7 +326,7 @@ fn launch_ssh(host_pattern: &str) -> Result<()> {
 }
 
 mod ui {
-    pub use crate::ui::{draw_ui, edit_host_dialog, new_host_dialog, read_event, Event, UiAction};
+    pub use crate::ui::read_event;
 }
 
 
