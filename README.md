@@ -79,7 +79,7 @@ If you want to revert, restore the backup.
 - Edition mismatch errors: update Rust (`rustup update stable`).
 - Nothing shows up: ensure you have at least one `Host` block in `~/.ssh/config`.
 
-## Roadmap (optional)
+## Roadmap
 - Optional app config (colors, defaults) in `~/.config/ssh-picker/config.toml`.
 - Support for reading from `Include`d files.
 - Preserve comments within edited blocks.
